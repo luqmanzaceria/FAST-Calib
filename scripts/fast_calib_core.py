@@ -314,46 +314,77 @@ def align_plane_to_z0(pts_xyz: np.ndarray, plane_normal: np.ndarray):
     return aligned[:, :2], R, avg_z
 
 
-def _plane_fit_ransac(pts_xyz: np.ndarray):
-    """RANSAC plane via open3d. Returns (normal 3-vec, inlier indices)."""
-    # Hard cap so segment_plane never receives an unmanageably large cloud.
-    _MAX_RANSAC_PTS = 100_000
-    if len(pts_xyz) > _MAX_RANSAC_PTS:
-        idx = np.random.choice(len(pts_xyz), _MAX_RANSAC_PTS, replace=False)
-        pts_xyz = pts_xyz[idx]
-    pcd = o3d.geometry.PointCloud()
-    pcd.points = o3d.utility.Vector3dVector(pts_xyz)
-    model, inliers = pcd.segment_plane(
-        distance_threshold=0.02, ransac_n=3, num_iterations=1000)
-    return np.array(model[:3]), np.asarray(inliers)
+def _voxel_downsample(xyz: np.ndarray, voxel_size: float) -> np.ndarray:
+    """Grid voxel downsample — pure numpy, no open3d PointCloud needed."""
+    coords = np.floor(xyz / voxel_size).astype(np.int64)
+    # Use a structured dtype for fast np.unique over 3-tuples
+    dt = np.dtype([('x', np.int64), ('y', np.int64), ('z', np.int64)])
+    keys = np.empty(len(coords), dtype=dt)
+    keys['x'] = coords[:, 0]
+    keys['y'] = coords[:, 1]
+    keys['z'] = coords[:, 2]
+    _, first = np.unique(keys, return_index=True)
+    return xyz[first]
+
+
+def _plane_fit_ransac(pts_xyz: np.ndarray,
+                      dist_thr: float = 0.02,
+                      n_iter: int = 500) -> tuple:
+    """
+    Pure-numpy RANSAC plane fit — no open3d required.
+    Returns (normal 3-vec, inlier index array).
+    """
+    n = len(pts_xyz)
+    # Random subsample to keep each iteration fast
+    _MAX = 20_000
+    if n > _MAX:
+        pts_xyz = pts_xyz[np.random.choice(n, _MAX, replace=False)]
+        n = _MAX
+
+    best_normal  = np.array([0., 0., 1.])
+    best_inliers = np.empty(0, dtype=np.intp)
+    rng = np.random.default_rng(0)
+
+    for _ in range(n_iter):
+        s = rng.choice(n, 3, replace=False)
+        v1 = pts_xyz[s[1]] - pts_xyz[s[0]]
+        v2 = pts_xyz[s[2]] - pts_xyz[s[0]]
+        nrm = np.cross(v1, v2)
+        length = np.linalg.norm(nrm)
+        if length < 1e-10:
+            continue
+        nrm /= length
+        d = -float(nrm @ pts_xyz[s[0]])
+        dists = np.abs(pts_xyz @ nrm + d)
+        inliers = np.where(dists < dist_thr)[0]
+        if len(inliers) > len(best_inliers):
+            best_inliers = inliers
+            best_normal  = nrm.copy()
+
+    return best_normal, best_inliers
 
 
 def _boundary_indices(pts_2d: np.ndarray, radius: float = 0.03,
                       min_gap: float = np.pi / 4) -> np.ndarray:
     """
-    Return indices of boundary points using the max-angular-gap criterion
-    (mirrors PCL BoundaryEstimation with angle_threshold = M_PI/4).
+    Return indices of boundary points using the max-angular-gap criterion.
+    Pure numpy (squared-distance brute force) — no open3d Vector3dVector.
+    Fast enough for the typical few-thousand-point plane cloud.
     """
     if len(pts_2d) < 3:
         return np.arange(len(pts_2d))
 
-    # Build open3d KDTree on the 2-D cloud (z=0) — no scipy needed
-    pts3d = np.column_stack([pts_2d, np.zeros(len(pts_2d))])
-    pcd   = o3d.geometry.PointCloud()
-    pcd.points = o3d.utility.Vector3dVector(pts3d)
-    kdtree = o3d.geometry.KDTreeFlann(pcd)
-
+    r2 = radius * radius
     n_pts       = len(pts_2d)
     is_boundary = np.ones(n_pts, dtype=bool)
 
     for i, p in enumerate(pts_2d):
-        k, idx, _ = kdtree.search_radius_vector_3d(
-            [float(p[0]), float(p[1]), 0.0], radius)
-        nbrs = [int(j) for j in idx if int(j) != i]
+        diff = pts_2d - p                          # (N, 2)
+        sq   = (diff * diff).sum(axis=1)
+        nbrs = np.where((sq < r2) & (sq > 0))[0]
         if len(nbrs) < 2:
             continue
-        vecs   = pts_2d[nbrs] - p
-        angles = np.arctan2(vecs[:, 1], vecs[:, 0])
+        angles = np.arctan2(diff[nbrs, 1], diff[nbrs, 0])
         a      = np.sort(angles)
         gaps   = np.diff(a)
         wrap   = 2 * np.pi + a[0] - a[-1]
@@ -504,16 +535,8 @@ def detect_solid_lidar(pts_N4: np.ndarray, cfg: dict):
     if len(xyz) < 20:
         return None
 
-    # 2. Voxel downsample — use 2 cm leaf; also cap at 300 K before voxel
-    #    to avoid Open3D segfaults on very dense accumulated clouds.
-    _MAX_PTS_BEFORE_VOXEL = 300_000
-    if len(xyz) > _MAX_PTS_BEFORE_VOXEL:
-        idx = np.random.choice(len(xyz), _MAX_PTS_BEFORE_VOXEL, replace=False)
-        xyz = xyz[idx]
-    pcd = o3d.geometry.PointCloud()
-    pcd.points = o3d.utility.Vector3dVector(xyz)
-    pcd = pcd.voxel_down_sample(0.02)          # 2 cm leaf (was 5 mm)
-    xyz = np.asarray(pcd.points)
+    # 2. Voxel downsample — 2 cm leaf, pure numpy (no open3d PointCloud)
+    xyz = _voxel_downsample(xyz, 0.02)
     print(f"[LiDAR-solid] after voxel: {len(xyz)} pts")
 
     # 3. RANSAC plane

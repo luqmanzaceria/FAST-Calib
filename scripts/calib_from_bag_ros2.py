@@ -28,6 +28,7 @@ from __future__ import annotations
 import argparse
 import os
 import sqlite3
+import struct
 import sys
 from pathlib import Path
 
@@ -40,6 +41,116 @@ sys.path.insert(0, str(_HERE))
 from fast_calib_core import (
     load_config, decode_pointcloud2, decode_image_msg, run_calibration
 )
+
+# ════════════════════════════════════════════════════════════════════════════
+# Minimal CDR parser — no rosbags required
+# Handles sensor_msgs/msg/Image and sensor_msgs/msg/PointCloud2
+# ════════════════════════════════════════════════════════════════════════════
+
+class _CdrParser:
+    """Walk through a CDR-encoded ROS2 message byte-by-byte."""
+
+    def __init__(self, raw: bytes) -> None:
+        if len(raw) < 4:
+            raise ValueError("CDR data too short")
+        self._raw    = raw
+        self._pos    = 4                         # skip 4-byte encapsulation header
+        self._endian = '<' if (raw[1] & 1) else '>'
+
+    def _align(self, n: int) -> None:
+        r = self._pos % n
+        if r:
+            self._pos += n - r
+
+    def uint8(self) -> int:
+        v = self._raw[self._pos]; self._pos += 1; return v
+
+    def int32(self) -> int:
+        self._align(4)
+        v, = struct.unpack_from(self._endian + 'i', self._raw, self._pos)
+        self._pos += 4; return v
+
+    def uint32(self) -> int:
+        self._align(4)
+        v, = struct.unpack_from(self._endian + 'I', self._raw, self._pos)
+        self._pos += 4; return v
+
+    def string(self) -> str:
+        length = self.uint32()           # includes null terminator
+        if length == 0:
+            return ''
+        s = self._raw[self._pos:self._pos + length - 1].decode('utf-8', errors='replace')
+        self._pos += length; return s
+
+    def read_bytes(self, n: int) -> bytes:
+        v = self._raw[self._pos:self._pos + n]; self._pos += n; return v
+
+
+class _FakeImageMsg:
+    __slots__ = ('height', 'width', 'encoding', 'data')
+    def __init__(self, height, width, encoding, data):
+        self.height = height; self.width = width
+        self.encoding = encoding; self.data = data
+
+
+class _FakeField:
+    __slots__ = ('name', 'offset', 'datatype')
+    def __init__(self, name, offset, datatype):
+        self.name = name; self.offset = offset; self.datatype = datatype
+
+
+class _FakePc2Msg:
+    __slots__ = ('height', 'width', 'fields', 'point_step', 'row_step', 'data')
+    def __init__(self, height, width, fields, point_step, row_step, data):
+        self.height = height; self.width = width; self.fields = fields
+        self.point_step = point_step; self.row_step = row_step; self.data = data
+
+
+def _cdr_parse_image(raw: bytes):
+    """Decode sensor_msgs/msg/Image without rosbags."""
+    try:
+        p = _CdrParser(raw)
+        p.int32(); p.uint32()        # Header.stamp (sec, nanosec)
+        p.string()                   # Header.frame_id
+        height   = p.uint32()
+        width    = p.uint32()
+        encoding = p.string()
+        p.uint8()                    # is_bigendian
+        p.uint32()                   # step (auto-aligns past is_bigendian)
+        data = p.read_bytes(p.uint32())
+        return _FakeImageMsg(height, width, encoding, data)
+    except Exception:
+        return None
+
+
+def _cdr_parse_pc2(raw: bytes):
+    """Decode sensor_msgs/msg/PointCloud2 without rosbags."""
+    try:
+        p = _CdrParser(raw)
+        p.int32(); p.uint32()        # Header.stamp
+        p.string()                   # Header.frame_id
+        height = p.uint32()
+        width  = p.uint32()
+        fields = []
+        for _ in range(p.uint32()):  # PointField[] sequence
+            name     = p.string()
+            offset   = p.uint32()
+            datatype = p.uint8()
+            p.uint32()               # count (auto-aligns past datatype)
+            fields.append(_FakeField(name, offset, datatype))
+        p.uint8()                    # is_bigendian
+        point_step = p.uint32()      # auto-aligns
+        row_step   = p.uint32()
+        data = p.read_bytes(p.uint32())
+        return _FakePc2Msg(height, width, fields, point_step, row_step, data)
+    except Exception:
+        return None
+
+
+_CDR_FALLBACK = {
+    "sensor_msgs/msg/Image":       _cdr_parse_image,
+    "sensor_msgs/msg/PointCloud2": _cdr_parse_pc2,
+}
 
 # ════════════════════════════════════════════════════════════════════════════
 # Path resolution — find .db3 file(s) from whatever path the user gave
@@ -94,6 +205,9 @@ class _SqliteReader:
                     "SELECT id, name, type FROM topics"):
                 self._topics.setdefault(name, (tid, typename))
         self._typestore = self._pick_typestore()
+        if self._typestore is None:
+            print("  [Bag] rosbags not installed — using built-in CDR decoder "
+                  "(Image + PointCloud2 only).", flush=True)
         return self
 
     def __exit__(self, *_):
@@ -140,16 +254,20 @@ class _SqliteReader:
                     yield ts, msg
 
     def _deserialize(self, raw: bytes, typename: str):
-        if self._typestore is None:
-            return None
-        try:
-            return self._typestore.deserialize_cdr(raw, typename)
-        except Exception:
+        # Try rosbags typestore first (richer; supports all message types)
+        if self._typestore is not None:
             try:
-                # Some versions wrap with a 4-byte CDR encapsulation
-                return self._typestore.deserialize_cdr(raw[4:], typename)
+                return self._typestore.deserialize_cdr(raw, typename)
             except Exception:
-                return None
+                try:
+                    return self._typestore.deserialize_cdr(raw[4:], typename)
+                except Exception:
+                    pass
+        # Fall back to built-in CDR parser for the two types we need
+        fallback = _CDR_FALLBACK.get(typename)
+        if fallback:
+            return fallback(raw)
+        return None
 
 
 # ════════════════════════════════════════════════════════════════════════════

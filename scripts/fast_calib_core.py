@@ -3,7 +3,7 @@
 fast_calib_core.py — Pure-Python port of the FAST-Calib detection pipeline.
 
 No ROS required.  Dependencies (pip install):
-    numpy opencv-python open3d scipy pyyaml
+    numpy opencv-python open3d pyyaml
 
 Implements the same algorithms as the C++ nodes:
   • QR / ArUco board detection  → 4 circle centers in camera frame
@@ -25,7 +25,6 @@ import cv2
 import cv2.aruco as aruco
 import open3d as o3d
 from pathlib import Path
-from scipy.spatial import cKDTree
 
 # ────────────────────────────────────────────────────────────────────────────
 # Constants (mirror C++ #defines)
@@ -322,29 +321,27 @@ def _boundary_indices(pts_2d: np.ndarray, radius: float = 0.03,
     if len(pts_2d) < 3:
         return np.arange(len(pts_2d))
 
-    tree   = cKDTree(pts_2d)
-    pairs  = tree.query_pairs(radius, output_type="ndarray")  # Mx2
+    # Build open3d KDTree on the 2-D cloud (z=0) — no scipy needed
+    pts3d = np.column_stack([pts_2d, np.zeros(len(pts_2d))])
+    pcd   = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(pts3d)
+    kdtree = o3d.geometry.KDTreeFlann(pcd)
 
-    # Accumulate angles per point
     n_pts       = len(pts_2d)
-    angle_lists = [[] for _ in range(n_pts)]
-    for i, j in pairs:
-        dx = pts_2d[j, 0] - pts_2d[i, 0]
-        dy = pts_2d[j, 1] - pts_2d[i, 1]
-        aij = float(np.arctan2(dy, dx))
-        angle_lists[i].append(aij)
-        angle_lists[j].append(-aij + (np.pi if aij < 0 else -np.pi)
-                               if False else np.arctan2(-dy, -dx))
-
     is_boundary = np.ones(n_pts, dtype=bool)
-    for i, angs in enumerate(angle_lists):
-        if len(angs) < 2:
+
+    for i, p in enumerate(pts_2d):
+        k, idx, _ = kdtree.search_radius_vector_3d(
+            [float(p[0]), float(p[1]), 0.0], radius)
+        nbrs = [int(j) for j in idx if int(j) != i]
+        if len(nbrs) < 2:
             continue
-        a = np.sort(angs)
-        gaps    = np.diff(a)
-        wrap    = 2 * np.pi + a[0] - a[-1]
-        max_gap = float(max(gaps.max(), wrap))
-        is_boundary[i] = max_gap > min_gap
+        vecs   = pts_2d[nbrs] - p
+        angles = np.arctan2(vecs[:, 1], vecs[:, 0])
+        a      = np.sort(angles)
+        gaps   = np.diff(a)
+        wrap   = 2 * np.pi + a[0] - a[-1]
+        is_boundary[i] = float(max(gaps.max(), wrap)) > min_gap
 
     return np.where(is_boundary)[0]
 

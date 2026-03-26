@@ -548,26 +548,41 @@ def detect_solid_lidar(pts_N4: np.ndarray, cfg: dict):
     xyz = _voxel_downsample(xyz, 0.02)
     print(f"[LiDAR-solid] after voxel: {len(xyz)} pts")
 
-    # 3. RANSAC plane — iterate until we find a board-sized plane
-    #    Board is at most ~2 m in any direction; reject huge planes (floor/wall/ceiling)
-    MAX_PLANE_EXTENT = 2.5   # metres
-    normal, inliers = _plane_fit_ransac(xyz)
-    plane_pts       = xyz[inliers]
-    pts_2d_tmp, _, _ = align_plane_to_z0(plane_pts, normal)
-    extent = max(pts_2d_tmp[:,0].max()-pts_2d_tmp[:,0].min(),
-                 pts_2d_tmp[:,1].max()-pts_2d_tmp[:,1].min())
+    # 3. Iterative RANSAC: peel away large planes (floor/walls) until we find
+    #    a board-sized one.  Board is ≤2 m in any direction.
+    MAX_PLANE_EXTENT = 2.0   # metres
+    MAX_ATTEMPTS     = 8
+    xyz_work = xyz.copy()
+    plane_pts = normal = None
+
+    for attempt in range(MAX_ATTEMPTS):
+        if len(xyz_work) < 50:
+            break
+        n_tmp, idx_tmp = _plane_fit_ransac(xyz_work)
+        p_tmp          = xyz_work[idx_tmp]
+        pts2d_tmp, _, _ = align_plane_to_z0(p_tmp, n_tmp)
+        ext = max(float(pts2d_tmp[:,0].max() - pts2d_tmp[:,0].min()),
+                  float(pts2d_tmp[:,1].max() - pts2d_tmp[:,1].min()))
+        print(f"[LiDAR-solid] plane attempt {attempt+1}: "
+              f"{len(p_tmp)} inliers  "
+              f"normal=[{n_tmp[0]:.2f},{n_tmp[1]:.2f},{n_tmp[2]:.2f}]  "
+              f"extent={ext:.2f} m", flush=True)
+        if ext <= MAX_PLANE_EXTENT:
+            normal, inliers_work, plane_pts = n_tmp, idx_tmp, p_tmp
+            break
+        # Remove this large plane's inliers and try again
+        keep = np.ones(len(xyz_work), dtype=bool)
+        keep[idx_tmp] = False
+        xyz_work = xyz_work[keep]
+
+    if plane_pts is None:
+        print(f"[LiDAR-solid] no board-sized plane found after {MAX_ATTEMPTS} attempts")
+        print(f"  → tighten x/y/z_min/max in config/qr_params.yaml to isolate the board")
+        return None
+
     print(f"[LiDAR-solid] plane inliers: {len(plane_pts)} pts  "
           f"normal=[{normal[0]:.2f},{normal[1]:.2f},{normal[2]:.2f}]  "
-          f"extent={extent:.2f} m")
-    if extent > MAX_PLANE_EXTENT:
-        print(f"  → plane too large ({extent:.2f} m > {MAX_PLANE_EXTENT} m) — "
-              f"likely floor/wall, not the calibration board")
-        print(f"  → tighten x/y/z_min/max in config/qr_params.yaml to isolate the board")
-        print(f"  → board bbox hint: "
-              f"x=[{plane_pts[:,0].min():.2f},{plane_pts[:,0].max():.2f}]  "
-              f"y=[{plane_pts[:,1].min():.2f},{plane_pts[:,1].max():.2f}]  "
-              f"z=[{plane_pts[:,2].min():.2f},{plane_pts[:,2].max():.2f}]")
-        return None
+          f"extent={ext:.2f} m")
 
     # 4. Align to Z=0
     pts_2d, R_align, avg_z = align_plane_to_z0(plane_pts, normal)

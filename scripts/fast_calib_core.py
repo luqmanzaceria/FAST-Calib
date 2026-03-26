@@ -108,10 +108,21 @@ def decode_pointcloud2(msg) -> np.ndarray:
 
 
 def decode_image_msg(msg) -> np.ndarray:
-    """Convert sensor_msgs/Image message to a BGR uint8 numpy array."""
+    """Convert sensor_msgs/Image or sensor_msgs/CompressedImage to BGR uint8."""
+    raw = msg.data if isinstance(msg.data, (bytes, bytearray)) else bytes(msg.data)
+
+    # CompressedImage has no 'encoding' field; Image always does.
+    # (Don't use hasattr(msg, 'format') — every Python object inherits __format__.)
+    if not hasattr(msg, 'encoding'):
+        arr = np.frombuffer(raw, np.uint8)
+        bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+        if bgr is None:
+            fmt = getattr(msg, 'format', '?')
+            raise ValueError(f"cv2.imdecode failed for compressed image (format={fmt})")
+        return bgr
+
     h, w = int(msg.height), int(msg.width)
     enc  = msg.encoding
-    raw  = msg.data if isinstance(msg.data, (bytes, bytearray)) else bytes(msg.data)
 
     if enc in ("bgr8", "rgb8"):
         arr = np.frombuffer(raw, np.uint8).reshape(h, w, 3)

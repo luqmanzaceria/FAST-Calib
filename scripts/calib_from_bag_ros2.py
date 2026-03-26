@@ -148,9 +148,29 @@ def _cdr_parse_pc2(raw: bytes):
         return None
 
 
+class _FakeCompressedImageMsg:
+    __slots__ = ('format', 'data')
+    def __init__(self, fmt, data):
+        self.format = fmt; self.data = data
+
+
+def _cdr_parse_compressed_image(raw: bytes):
+    """Decode sensor_msgs/msg/CompressedImage without rosbags."""
+    try:
+        p = _CdrParser(raw)
+        p.int32(); p.uint32()        # Header.stamp
+        p.string()                   # Header.frame_id
+        fmt  = p.string()            # format, e.g. "jpeg", "png"
+        data = p.read_bytes(p.uint32())
+        return _FakeCompressedImageMsg(fmt, data)
+    except Exception:
+        return None
+
+
 _CDR_FALLBACK = {
-    "sensor_msgs/msg/Image":       _cdr_parse_image,
-    "sensor_msgs/msg/PointCloud2": _cdr_parse_pc2,
+    "sensor_msgs/msg/Image":            _cdr_parse_image,
+    "sensor_msgs/msg/CompressedImage":  _cdr_parse_compressed_image,
+    "sensor_msgs/msg/PointCloud2":      _cdr_parse_pc2,
 }
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -364,6 +384,8 @@ def _iter_topic(reader, topic: str):
         yield from reader.iter_messages(topic)
     else:
         conns = [c for c in reader.connections if c.topic == topic]
+        if not conns:
+            return   # topic not in bag — don't fall through to all-messages
         for conn, ts, raw in reader.messages(connections=conns):
             try:
                 yield ts, reader.deserialize(raw, conn.msgtype)
@@ -506,8 +528,19 @@ def _auto_lidar_topic(topics: list[str]) -> str | None:
 
 
 def _auto_image_topic(topics: list[str]) -> str | None:
+    # 1. Prefer raw (uncompressed) color image topics
     for t in topics:
-        if "image" in t.lower() and "compressed" not in t.lower():
+        tl = t.lower()
+        if "image" in tl and "depth" not in tl and "compressed" not in tl:
+            return t
+    # 2. Fall back to compressed color image topics
+    for t in topics:
+        tl = t.lower()
+        if "image" in tl and "depth" not in tl:
+            return t
+    # 3. Any image topic at all
+    for t in topics:
+        if "image" in t.lower():
             return t
     return None
 

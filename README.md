@@ -29,7 +29,16 @@ In short, it makes extrinsic calibration as simple as intrinsic calibration.
 </p>
 
 ## 1. Prerequisites
-PCL>=1.8, OpenCV>=4.0.
+PCL>=1.8, OpenCV>=4.0, **ROS 1** (e.g. Noetic) with this package built in a catkin workspace.
+
+### macOS
+FAST-Calib is a ROS1 node (`rospack`, `rosrun`, `roscore`). **ROS 2** (Humble, Jazzy, etc.) does not provide those tools, and there is no standard `/opt/ros/noetic` install on Apple Silicon the way there is on Ubuntu.
+
+To run calibration on a Mac, use one of:
+- **Docker**: e.g. `osrf/ros:noetic-desktop-full`, mount this repo, build the workspace inside the container, then run `scripts/calib_from_bag.sh` there.
+- **Linux VM** or **remote Linux machine** where ROS Noetic + dependencies are installed.
+
+Offline bag script (ROS2 `.db3` → converted `.bag` + `fast_calib`): see `scripts/calib_from_bag.sh` — it still requires a sourced ROS1 workspace after conversion.
 
 ## 2. Run our examples
 1. Prepare the static acquisition data in the `calib_data` folder (see [Single-scene Calibration Sample Data](https://drive.google.com/drive/folders/1W87Dx3MUuPhTpCLvaavWqNUJZV03yU6L?usp=drive_link) from Mid360, Avia and Ouster, and [Multi-scene Calibration Sample Data](https://drive.google.com/drive/folders/1g__plgFqp5tsk-TY7Ioh4RXru62AdLmr?usp=drive_link) from Avia):

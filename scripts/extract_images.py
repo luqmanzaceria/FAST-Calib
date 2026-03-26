@@ -8,18 +8,19 @@ import os
 bridge = CvBridge()
 
 if len(sys.argv) < 3:
-    print("Usage: python extract_images.py <bag_name.bag> <output_dir>")
+    print("Usage: python extract_images.py <bag_name.bag> <output_dir> [image_topic]")
     sys.exit(1)
 
 bag_name = sys.argv[1]
 output_dir = sys.argv[2]
+image_topic = sys.argv[3] if len(sys.argv) >= 4 else '/camera/image_raw'
 
 best_image = None
 best_score = -1
 
 with rosbag.Bag(bag_name, 'r') as bag:
     count = 0
-    for topic, msg, t in bag.read_messages(topics=['/camera/image_raw']):
+    for topic, msg, t in bag.read_messages(topics=[image_topic]):
         cv_img = bridge.imgmsg_to_cv2(msg, "bgr8")
         gray = cv2.cvtColor(cv_img, cv2.COLOR_BGR2GRAY)
         aruco_dict = aruco.Dictionary_get(aruco.DICT_6X6_250)

@@ -43,3 +43,10 @@ target_link_libraries(multi_fast_calib
   ${PCL_LIBRARIES}
   ${OpenCV_LIBRARIES}
 )
+
+add_executable(live_calib src/live_calib.cpp)
+target_link_libraries(live_calib
+  ${catkin_LIBRARIES}
+  ${PCL_LIBRARIES}
+  ${OpenCV_LIBRARIES}
+)

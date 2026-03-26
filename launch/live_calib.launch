@@ -1,0 +1,43 @@
+<launch>
+  <!--
+    live_calib.launch — FAST-Calib live LiDAR-camera extrinsic calibration
+    =========================================================================
+    Subscribes to a live camera image topic and a LiDAR point-cloud topic,
+    accumulates data, then computes and saves T_cam_lidar.
+
+    Usage examples:
+      # Default topics (/camera/image_raw + topic from qr_params.yaml):
+      roslaunch fast_calib live_calib.launch
+
+      # Override topics at launch time:
+      roslaunch fast_calib live_calib.launch \
+          image_topic:=/camera/color/image_raw \
+          lidar_topic:=/ouster/points
+
+      # With RViz visualization:
+      roslaunch fast_calib live_calib.launch rviz:=true
+  -->
+
+  <arg name="image_topic"    default="/camera/image_raw"/>
+  <arg name="lidar_topic"    default=""/>          <!-- empty → use qr_params.yaml value -->
+  <arg name="calib_interval" default="5.0"/>       <!-- seconds between calibration attempts -->
+  <arg name="rviz"           default="false"/>
+
+  <!-- Load shared calibration parameters from config file -->
+  <rosparam file="$(find fast_calib)/config/qr_params.yaml"
+            command="load" subst_value="true"/>
+
+  <!-- Override individual params from launch args -->
+  <param name="image_topic"    value="$(arg image_topic)"/>
+  <param name="calib_interval" value="$(arg calib_interval)"/>
+  <param if="$(eval arg('lidar_topic') != '')"
+         name="lidar_topic" value="$(arg lidar_topic)"/>
+
+  <node pkg="fast_calib" type="live_calib" name="live_calib" output="screen"/>
+
+  <group if="$(arg rviz)">
+    <node launch-prefix="nice" pkg="rviz" type="rviz" name="rviz"
+          args="-d $(find fast_calib)/rviz_cfg/fast_livo2.rviz"/>
+  </group>
+
+</launch>

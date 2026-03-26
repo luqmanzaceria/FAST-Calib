@@ -339,8 +339,13 @@ def list_topics(bag_path: Path, db3_files: list[Path]) -> None:
 
 def _best_image_from_bag(bag_path: Path, db3_files: list[Path],
                           image_topic: str, min_markers: int,
-                          aruco_dict) -> np.ndarray | None:
+                          aruco_dict,
+                          save_any_frame: str | None = None) -> np.ndarray | None:
     best_img, best_score, best_n = None, -1.0, 0
+    n_iter = n_dec = n_aruco = 0
+    first_enc: str | None = None
+    first_dec_err: str | None = None
+    first_raw_frame: np.ndarray | None = None  # for --save-any-frame
 
     try:
         det_params = aruco.DetectorParameters()
@@ -357,18 +362,60 @@ def _best_image_from_bag(bag_path: Path, db3_files: list[Path],
     reader = _open_reader(bag_path, db3_files)
     with reader:
         for _ts, msg in _iter_topic(reader, image_topic):
+            n_iter += 1
             try:
                 bgr = decode_image_msg(msg)
-            except Exception:
+                n_dec += 1
+                if first_enc is None:
+                    first_enc = getattr(msg, 'encoding', '?')
+                if first_raw_frame is None:
+                    first_raw_frame = bgr.copy()
+            except Exception as exc:
+                if first_dec_err is None:
+                    first_dec_err = str(exc)
                 continue
             gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
             n    = _detect(gray)
+            if n > 0:
+                n_aruco += 1
             if n >= min_markers:
                 sh = float(cv2.Laplacian(gray, cv2.CV_64F).var())
                 if n > best_n or (n == best_n and sh > best_score):
                     best_img, best_score, best_n = bgr.copy(), sh, n
                     print(f"  [Image] best so far: {n} markers, sharpness={sh:.1f}",
                           flush=True)
+
+    # Save first decoded frame for inspection regardless of ArUco result
+    if save_any_frame and first_raw_frame is not None:
+        cv2.imwrite(save_any_frame, first_raw_frame)
+        print(f"  [Image] saved first decoded frame → {save_any_frame}", flush=True)
+
+    if best_img is None:
+        if n_iter == 0:
+            print(f"  [Image] WARNING: 0 messages on topic '{image_topic}'.",
+                  flush=True)
+            print(f"          Check topic name with --list-topics.", flush=True)
+        elif n_dec == 0:
+            print(f"  [Image] WARNING: iterated {n_iter} msgs but decoded 0 images.",
+                  flush=True)
+            if first_dec_err:
+                print(f"          decode error: {first_dec_err}", flush=True)
+            print(f"          Try: pip install rosbags", flush=True)
+        elif n_aruco == 0:
+            print(f"  [Image] WARNING: decoded {n_dec}/{n_iter} frames "
+                  f"(encoding={first_enc}) but no ArUco markers found in any.",
+                  flush=True)
+            print(f"          • Is the calibration board visible in the bag?",
+                  flush=True)
+            print(f"          • Use --save-any-frame output/raw_frame.png to inspect.",
+                  flush=True)
+        else:
+            print(f"  [Image] WARNING: {n_aruco} frames had ArUco markers but "
+                  f"none reached min_detected_markers={min_markers}.",
+                  flush=True)
+            print(f"          Lower min_detected_markers in {{}}/qr_params.yaml "
+                  f"or reposition the board.", flush=True)
+
     return best_img
 
 
@@ -427,6 +474,9 @@ def parse_args():
                    help="Output directory (default: <repo>/output)")
     p.add_argument("--list-topics", action="store_true",
                    help="Print all topics and exit")
+    p.add_argument("--save-any-frame", default=None, metavar="PATH",
+                   help="Save first decoded image frame to PATH (e.g. output/frame.png) "
+                        "regardless of ArUco detection, for visual inspection")
     return p.parse_args()
 
 
@@ -495,7 +545,8 @@ def main():
         print(f"[Image] Scanning '{image_topic}' for best ArUco frame …")
         adict = aruco.getPredefinedDictionary(aruco.DICT_6X6_250)
         image = _best_image_from_bag(bag_path, db3_files, image_topic,
-                                     int(cfg["min_detected_markers"]), adict)
+                                     int(cfg["min_detected_markers"]), adict,
+                                     save_any_frame=args.save_any_frame)
         if image is None:
             sys.exit(
                 f"[ERROR] No suitable image found on '{image_topic}'.\n"

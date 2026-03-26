@@ -503,17 +503,30 @@ def _best_image_from_bag(bag_path: Path, bag_files: list[Path],
 
 
 def _read_cloud(bag_path: Path, bag_files: list[Path],
-                lidar_topic: str) -> np.ndarray:
+                lidar_topic: str,
+                max_frames: int = 50) -> np.ndarray:
+    """
+    Read at most `max_frames` PointCloud2 messages and concatenate them.
+    50 frames at 10 Hz = 5 s of data; more than enough for calibration.
+    Use --max-cloud-frames 0 to read everything (may be very slow/large).
+    """
     parts = []
+    n_frames = 0
     reader = _open_reader(bag_path, bag_files)
     with reader:
         for _ts, msg in _iter_topic(reader, lidar_topic):
+            if max_frames and n_frames >= max_frames:
+                break
             try:
                 pts = decode_pointcloud2(msg)
                 if len(pts):
                     parts.append(pts)
+                    n_frames += 1
             except Exception as e:
                 print(f"  [Cloud] decode error: {e}", file=sys.stderr)
+    if max_frames and n_frames >= max_frames:
+        print(f"  [Cloud] stopped after {n_frames} frames "
+              f"(use --max-cloud-frames 0 to read all)", flush=True)
     return np.concatenate(parts, axis=0) if parts else np.zeros((0, 4), np.float32)
 
 
@@ -596,6 +609,9 @@ def parse_args():
                    help="Override min_detected_markers from config")
     p.add_argument("--save-any-frame", default=None, metavar="PATH",
                    help="Save best ArUco frame to PATH for visual inspection")
+    p.add_argument("--max-cloud-frames", type=int, default=50, metavar="N",
+                   help="Max LiDAR frames to accumulate (default: 50 ≈ 5 s at 10 Hz).\n"
+                        "Use 0 to read all frames (may use a lot of RAM).")
     return p.parse_args()
 
 
@@ -682,8 +698,11 @@ def main():
         print(f"[Image] Saved extracted image: {saved}")
 
     # ── point cloud ───────────────────────────────────────────────────────────
-    print(f"\n[Cloud] Reading all messages on '{lidar_topic}' …")
-    pts_N4 = _read_cloud(lidar_bag_path, lidar_bag_files, lidar_topic)
+    max_frames = args.max_cloud_frames
+    print(f"\n[Cloud] Reading {'all' if not max_frames else f'up to {max_frames}'} "
+          f"frames on '{lidar_topic}' …")
+    pts_N4 = _read_cloud(lidar_bag_path, lidar_bag_files, lidar_topic,
+                         max_frames=max_frames)
     if len(pts_N4) == 0:
         sys.exit(
             f"[ERROR] No point cloud data found on '{lidar_topic}'.\n"

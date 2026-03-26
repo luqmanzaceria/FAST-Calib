@@ -533,17 +533,41 @@ def detect_solid_lidar(pts_N4: np.ndarray, cfg: dict):
     xyz = passthrough_filter(pts_N4[:, :3], cfg)
     print(f"[LiDAR-solid] after filter: {len(xyz)} pts")
     if len(xyz) < 20:
+        print(f"  → cloud bbox  x=[{pts_N4[:,0].min():.2f},{pts_N4[:,0].max():.2f}]"
+              f"  y=[{pts_N4[:,1].min():.2f},{pts_N4[:,1].max():.2f}]"
+              f"  z=[{pts_N4[:,2].min():.2f},{pts_N4[:,2].max():.2f}]")
+        print(f"  → tighten x/y/z_min/max in qr_params.yaml to surround the board")
         return None
+
+    # Print bbox so user can tune filter bounds
+    print(f"  → bbox  x=[{xyz[:,0].min():.2f},{xyz[:,0].max():.2f}]"
+          f"  y=[{xyz[:,1].min():.2f},{xyz[:,1].max():.2f}]"
+          f"  z=[{xyz[:,2].min():.2f},{xyz[:,2].max():.2f}]")
 
     # 2. Voxel downsample — 2 cm leaf, pure numpy (no open3d PointCloud)
     xyz = _voxel_downsample(xyz, 0.02)
     print(f"[LiDAR-solid] after voxel: {len(xyz)} pts")
 
-    # 3. RANSAC plane
+    # 3. RANSAC plane — iterate until we find a board-sized plane
+    #    Board is at most ~2 m in any direction; reject huge planes (floor/wall/ceiling)
+    MAX_PLANE_EXTENT = 2.5   # metres
     normal, inliers = _plane_fit_ransac(xyz)
     plane_pts       = xyz[inliers]
+    pts_2d_tmp, _, _ = align_plane_to_z0(plane_pts, normal)
+    extent = max(pts_2d_tmp[:,0].max()-pts_2d_tmp[:,0].min(),
+                 pts_2d_tmp[:,1].max()-pts_2d_tmp[:,1].min())
     print(f"[LiDAR-solid] plane inliers: {len(plane_pts)} pts  "
-          f"normal=[{normal[0]:.2f},{normal[1]:.2f},{normal[2]:.2f}]")
+          f"normal=[{normal[0]:.2f},{normal[1]:.2f},{normal[2]:.2f}]  "
+          f"extent={extent:.2f} m")
+    if extent > MAX_PLANE_EXTENT:
+        print(f"  → plane too large ({extent:.2f} m > {MAX_PLANE_EXTENT} m) — "
+              f"likely floor/wall, not the calibration board")
+        print(f"  → tighten x/y/z_min/max in config/qr_params.yaml to isolate the board")
+        print(f"  → board bbox hint: "
+              f"x=[{plane_pts[:,0].min():.2f},{plane_pts[:,0].max():.2f}]  "
+              f"y=[{plane_pts[:,1].min():.2f},{plane_pts[:,1].max():.2f}]  "
+              f"z=[{plane_pts[:,2].min():.2f},{plane_pts[:,2].max():.2f}]")
+        return None
 
     # 4. Align to Z=0
     pts_2d, R_align, avg_z = align_plane_to_z0(plane_pts, normal)

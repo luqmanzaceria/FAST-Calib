@@ -316,10 +316,15 @@ def align_plane_to_z0(pts_xyz: np.ndarray, plane_normal: np.ndarray):
 
 def _plane_fit_ransac(pts_xyz: np.ndarray):
     """RANSAC plane via open3d. Returns (normal 3-vec, inlier indices)."""
+    # Hard cap so segment_plane never receives an unmanageably large cloud.
+    _MAX_RANSAC_PTS = 100_000
+    if len(pts_xyz) > _MAX_RANSAC_PTS:
+        idx = np.random.choice(len(pts_xyz), _MAX_RANSAC_PTS, replace=False)
+        pts_xyz = pts_xyz[idx]
     pcd = o3d.geometry.PointCloud()
     pcd.points = o3d.utility.Vector3dVector(pts_xyz)
     model, inliers = pcd.segment_plane(
-        distance_threshold=0.01, ransac_n=3, num_iterations=1000)
+        distance_threshold=0.02, ransac_n=3, num_iterations=1000)
     return np.array(model[:3]), np.asarray(inliers)
 
 
@@ -499,10 +504,15 @@ def detect_solid_lidar(pts_N4: np.ndarray, cfg: dict):
     if len(xyz) < 20:
         return None
 
-    # 2. Voxel downsample
+    # 2. Voxel downsample — use 2 cm leaf; also cap at 300 K before voxel
+    #    to avoid Open3D segfaults on very dense accumulated clouds.
+    _MAX_PTS_BEFORE_VOXEL = 300_000
+    if len(xyz) > _MAX_PTS_BEFORE_VOXEL:
+        idx = np.random.choice(len(xyz), _MAX_PTS_BEFORE_VOXEL, replace=False)
+        xyz = xyz[idx]
     pcd = o3d.geometry.PointCloud()
     pcd.points = o3d.utility.Vector3dVector(xyz)
-    pcd = pcd.voxel_down_sample(0.005)
+    pcd = pcd.voxel_down_sample(0.02)          # 2 cm leaf (was 5 mm)
     xyz = np.asarray(pcd.points)
     print(f"[LiDAR-solid] after voxel: {len(xyz)} pts")
 

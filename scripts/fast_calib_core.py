@@ -542,7 +542,8 @@ def detect_solid_lidar(pts_N4: np.ndarray, cfg: dict):
     # 3. RANSAC plane
     normal, inliers = _plane_fit_ransac(xyz)
     plane_pts       = xyz[inliers]
-    print(f"[LiDAR-solid] plane inliers: {len(plane_pts)} pts")
+    print(f"[LiDAR-solid] plane inliers: {len(plane_pts)} pts  "
+          f"normal=[{normal[0]:.2f},{normal[1]:.2f},{normal[2]:.2f}]")
 
     # 4. Align to Z=0
     pts_2d, R_align, avg_z = align_plane_to_z0(plane_pts, normal)
@@ -586,7 +587,29 @@ def detect_solid_lidar(pts_N4: np.ndarray, cfg: dict):
     R_inv = np.linalg.inv(R_align)
     centers_3d = np.array([R_inv @ np.array([cx, cy, avg_z])
                             for cx, cy in centers_2d])
-    return _pick_best_4(centers_3d, cfg)
+
+    # Diagnostics: print pairwise 3-D distances to help tune config
+    print(f"[LiDAR-solid] circle centers (LiDAR frame):")
+    for i, c in enumerate(centers_3d):
+        print(f"  [{i}]  x={c[0]:.3f}  y={c[1]:.3f}  z={c[2]:.3f}")
+    dists = []
+    from itertools import combinations as _comb
+    for i, j in _comb(range(len(centers_3d)), 2):
+        d = float(np.linalg.norm(centers_3d[i] - centers_3d[j]))
+        dists.append((i, j, d))
+    dists.sort(key=lambda x: x[2])
+    print(f"[LiDAR-solid] pairwise distances (sorted):")
+    for i, j, d in dists:
+        print(f"  [{i}↔{j}]  {d:.3f} m")
+    print(f"[LiDAR-solid] config: delta_width={cfg['delta_width_circles']:.3f}  "
+          f"delta_height={cfg['delta_height_circles']:.3f}  "
+          f"circle_radius={cfg['circle_radius']:.3f}")
+
+    result = _pick_best_4(centers_3d, cfg)
+    if result is None:
+        print("[LiDAR-solid] geometric check FAILED — "
+              "measured distances don't match delta_width/delta_height in config")
+    return result
 
 
 def detect_mech_lidar(pts_N4: np.ndarray, cfg: dict):

@@ -465,31 +465,50 @@ def _auto_image_topic(topics: list[str]) -> str | None:
 # Main
 # ════════════════════════════════════════════════════════════════════════════
 
+def _open_bag(path_str: str, label: str) -> tuple[Path, list[Path]]:
+    """Resolve a user-supplied bag path; print a summary; exit on failure."""
+    p = Path(path_str).resolve()
+    db3s = _resolve_db3(p)
+    if not db3s:
+        sys.exit(
+            f"[ERROR] No .db3 files found at: {p}\n"
+            f"  Make sure the path is the bag directory or the .db3 file itself.")
+    bag_path = db3s[0].parent
+    has_meta = _has_metadata(db3s[0])
+    print(f"[{label}] found {len(db3s)} db3 file(s): {[f.name for f in db3s]}")
+    print(f"[{label}] directory  : {bag_path}")
+    print(f"[{label}] metadata.yaml: "
+          f"{'YES' if has_meta else 'NO — using direct SQLite reader'}")
+    return bag_path, db3s
+
+
 def parse_args():
     p = argparse.ArgumentParser(
-        description="FAST-Calib offline calibration from a ROS2 .db3 bag.")
-    p.add_argument("--bag",         required=True,
-                   help="Bag directory or path to the .db3 file")
-    p.add_argument("--config",      default=None,
+        description="FAST-Calib offline calibration from a ROS2 .db3 bag.",
+        formatter_class=argparse.RawTextHelpFormatter)
+    p.add_argument("--bag",          required=True,
+                   help="LiDAR bag — directory or .db3 file\n"
+                        "(also used for the camera if --camera-bag is not given)")
+    p.add_argument("--camera-bag",   default=None,
+                   help="Separate camera bag — directory or .db3 file\n"
+                        "(use when camera and LiDAR were recorded in different bags)")
+    p.add_argument("--config",       default=None,
                    help="Path to qr_params.yaml "
                         "(default: <repo>/config/qr_params.yaml)")
-    p.add_argument("--image",       default=None,
-                   help="Camera image (PNG/JPEG). If omitted, "
-                        "extracted from --image-topic.")
-    p.add_argument("--image-topic", default=None,
-                   help="Camera topic for image extraction (auto-detected if omitted)")
-    p.add_argument("--lidar-topic", default=None,
+    p.add_argument("--image",        default=None,
+                   help="Camera image (PNG/JPEG). Skips bag image extraction.")
+    p.add_argument("--image-topic",  default=None,
+                   help="Camera topic name (auto-detected if omitted)")
+    p.add_argument("--lidar-topic",  default=None,
                    help="LiDAR PointCloud2 topic (auto-detected if omitted)")
-    p.add_argument("--output-dir",  default=None,
+    p.add_argument("--output-dir",   default=None,
                    help="Output directory (default: <repo>/output)")
-    p.add_argument("--list-topics", action="store_true",
-                   help="Print all topics and exit")
-    p.add_argument("--min-markers", type=int, default=None,
-                   help="Override min_detected_markers from config "
-                        "(useful when few markers are visible in the bag)")
+    p.add_argument("--list-topics",  action="store_true",
+                   help="Print all topics from both bags and exit")
+    p.add_argument("--min-markers",  type=int, default=None,
+                   help="Override min_detected_markers from config")
     p.add_argument("--save-any-frame", default=None, metavar="PATH",
-                   help="Save best ArUco frame (or first decoded frame) to PATH "
-                        "for visual inspection, regardless of min_markers threshold")
+                   help="Save best ArUco frame to PATH for visual inspection")
     return p.parse_args()
 
 
@@ -497,54 +516,57 @@ def main():
     args = parse_args()
 
     repo_root   = _HERE.parent
-    input_path  = Path(args.bag).resolve()
     config_path = args.config    or str(repo_root / "config" / "qr_params.yaml")
     output_dir  = args.output_dir or str(repo_root / "output")
 
     if not Path(config_path).exists():
         sys.exit(f"[ERROR] Config not found: {config_path}")
 
-    # ── find .db3 files ───────────────────────────────────────────────────────
-    db3_files = _resolve_db3(input_path)
-    if not db3_files:
-        sys.exit(
-            f"[ERROR] No .db3 files found at: {input_path}\n"
-            f"  Make sure the path is the bag directory or the .db3 file itself.")
+    # ── open bag(s) ───────────────────────────────────────────────────────────
+    lidar_bag_path, lidar_db3s = _open_bag(args.bag, "LiDAR bag")
 
-    # Bag root directory (for AnyReader if metadata.yaml exists)
-    bag_path = db3_files[0].parent
+    if args.camera_bag:
+        cam_bag_path, cam_db3s = _open_bag(args.camera_bag, "Camera bag")
+    else:
+        cam_bag_path, cam_db3s = lidar_bag_path, lidar_db3s
 
-    print(f"[Bag]   found {len(db3_files)} db3 file(s): "
-          f"{[p.name for p in db3_files]}")
-    print(f"[Bag]   directory  : {bag_path}")
-    has_meta = _has_metadata(db3_files[0])
-    print(f"[Bag]   metadata.yaml: {'YES' if has_meta else 'NO — using direct SQLite reader'}")
-
+    # ── list-topics ───────────────────────────────────────────────────────────
     if args.list_topics:
-        list_topics(bag_path, db3_files)
+        print("\nTopics in LiDAR bag:")
+        list_topics(lidar_bag_path, lidar_db3s)
+        if args.camera_bag:
+            print("\nTopics in camera bag:")
+            list_topics(cam_bag_path, cam_db3s)
         return
 
     cfg = load_config(config_path)
     os.makedirs(output_dir, exist_ok=True)
 
-    # ── topic resolution ──────────────────────────────────────────────────────
-    reader_tmp = _open_reader(bag_path, db3_files)
-    with reader_tmp:
-        all_topics = _topics_from_reader(reader_tmp)
-    print(f"[Bag]   topics found: {all_topics}")
+    # ── topic resolution — LiDAR bag ──────────────────────────────────────────
+    with _open_reader(lidar_bag_path, lidar_db3s) as r:
+        lidar_topics = _topics_from_reader(r)
+    print(f"[LiDAR bag] topics: {lidar_topics}")
 
     lidar_topic = (args.lidar_topic
                    or cfg.get("lidar_topic")
-                   or _auto_lidar_topic(all_topics))
-    image_topic = (args.image_topic
-                   or _auto_image_topic(all_topics)
-                   or "/camera/image_raw")
-
+                   or _auto_lidar_topic(lidar_topics))
     if not lidar_topic:
         sys.exit("[ERROR] No LiDAR topic found. Use --lidar-topic.")
+    print(f"[LiDAR bag] lidar_topic : {lidar_topic}")
 
-    print(f"[Bag]   lidar_topic : {lidar_topic}")
-    print(f"[Bag]   image_topic : {image_topic}")
+    # ── topic resolution — camera bag ─────────────────────────────────────────
+    if args.camera_bag:
+        with _open_reader(cam_bag_path, cam_db3s) as r:
+            cam_topics = _topics_from_reader(r)
+        print(f"[Camera bag] topics: {cam_topics}")
+    else:
+        cam_topics = lidar_topics
+
+    image_topic = (args.image_topic
+                   or _auto_image_topic(cam_topics)
+                   or "/camera/image_raw")
+    print(f"[Camera bag] image_topic : {image_topic}")
+
     print(f"[Config] {config_path}")
     print(f"[Output] {output_dir}\n")
 
@@ -560,7 +582,7 @@ def main():
         print(f"[Image] Scanning '{image_topic}' for best ArUco frame "
               f"(min_markers={min_markers}) …")
         adict = aruco.getPredefinedDictionary(aruco.DICT_6X6_250)
-        image = _best_image_from_bag(bag_path, db3_files, image_topic,
+        image = _best_image_from_bag(cam_bag_path, cam_db3s, image_topic,
                                      min_markers, adict,
                                      save_any_frame=args.save_any_frame)
         if image is None:
@@ -574,7 +596,7 @@ def main():
 
     # ── point cloud ───────────────────────────────────────────────────────────
     print(f"\n[Cloud] Reading all messages on '{lidar_topic}' …")
-    pts_N4 = _read_cloud(bag_path, db3_files, lidar_topic)
+    pts_N4 = _read_cloud(lidar_bag_path, lidar_db3s, lidar_topic)
     if len(pts_N4) == 0:
         sys.exit(
             f"[ERROR] No point cloud data found on '{lidar_topic}'.\n"

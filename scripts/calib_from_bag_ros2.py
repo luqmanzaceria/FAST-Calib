@@ -1,24 +1,25 @@
 #!/usr/bin/env python3
 """
 calib_from_bag_ros2.py — Offline LiDAR-camera extrinsic calibration
-                          from a ROS2 .db3 bag (or directory containing one).
+                          from a ROS2 bag (.db3 or .mcap).
 
 No ROS installation required.  Install dependencies with:
-    pip install rosbags numpy "opencv-python>=4.5" open3d pyyaml scipy
+    pip install "rosbags[mcap]" numpy "opencv-python>=4.5" open3d pyyaml
 
 Usage:
     python3 scripts/calib_from_bag_ros2.py \\
-        --bag    /path/to/bag_dir_or_db3  \\
-        --config config/qr_params.yaml    \\
-        [--image  /path/to/image.png]     \\
-        [--image-topic  /camera/image_raw] \\
-        [--lidar-topic  /sensor_scan]     \\
-        [--output-dir   output/]
+        --bag        /path/to/lidar_bag   \\
+        --camera-bag /path/to/camera_bag  \\   # omit if same bag
+        --config     config/qr_params.yaml \\
+        [--image         /path/to/image.png]   \\
+        [--image-topic   /camera/image_raw]    \\
+        [--lidar-topic   /sensor_scan]         \\
+        [--output-dir    output/]
 
 The bag path may be:
-  • the bag DIRECTORY  (may contain metadata.yaml + *.db3)
+  • a bag DIRECTORY containing *.db3 or *.mcap files
   • the *.db3 FILE itself  (works even without metadata.yaml)
-  • a ROS1 *.bag file
+  • the *.mcap FILE itself
 
 If --image is omitted the script scans the image topic for the sharpest
 frame that has >= min_detected_markers ArUco markers visible.
@@ -153,32 +154,43 @@ _CDR_FALLBACK = {
 }
 
 # ════════════════════════════════════════════════════════════════════════════
-# Path resolution — find .db3 file(s) from whatever path the user gave
+# Path resolution — find bag file(s) (.db3 or .mcap) from user-supplied path
 # ════════════════════════════════════════════════════════════════════════════
 
-def _resolve_db3(path: Path) -> list[Path]:
+_BAG_SUFFIXES = (".db3", ".mcap")
+
+
+def _resolve_bag_files(path: Path) -> list[Path]:
     """
-    Return all .db3 files to read, given a user-supplied path.
-    Handles: .db3 file, bag directory with metadata.yaml, plain directory.
+    Return all bag files (.db3 or .mcap) to read, given a user-supplied path.
+    Prefers .mcap over .db3 when both are present in the same directory.
+    Searches one level deep into sub-directories.
     """
     path = path.resolve()
-    if path.is_file() and path.suffix == ".db3":
+    if path.is_file() and path.suffix in _BAG_SUFFIXES:
         return [path]
     if path.is_dir():
-        db3s = sorted(path.glob("*.db3"))
-        if db3s:
-            return db3s
-        # Maybe one level deeper (bag dir inside a parent dir)
+        for suffix in _BAG_SUFFIXES:
+            hits = sorted(path.glob(f"*{suffix}"))
+            if hits:
+                return hits
+        # One level deeper
         for sub in sorted(path.iterdir()):
             if sub.is_dir():
-                db3s = sorted(sub.glob("*.db3"))
-                if db3s:
-                    return db3s
+                for suffix in _BAG_SUFFIXES:
+                    hits = sorted(sub.glob(f"*{suffix}"))
+                    if hits:
+                        return hits
     return []
 
 
-def _has_metadata(db3: Path) -> bool:
-    return (db3.parent / "metadata.yaml").exists()
+def _bag_format(bag_files: list[Path]) -> str:
+    """Return 'mcap' or 'db3' based on the first file's suffix."""
+    return bag_files[0].suffix.lstrip(".") if bag_files else "unknown"
+
+
+def _has_metadata(bag_files: list[Path]) -> bool:
+    return bool(bag_files) and (bag_files[0].parent / "metadata.yaml").exists()
 
 # ════════════════════════════════════════════════════════════════════════════
 # SQLite reader — works even without metadata.yaml
@@ -271,33 +283,72 @@ class _SqliteReader:
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# High-level readers (try AnyReader first, fall back to SQLite)
+# High-level readers (try AnyReader first, fall back to SQLite for .db3)
 # ════════════════════════════════════════════════════════════════════════════
 
-def _open_any_reader(bag_path: Path):
+def _get_typestore():
+    """Return the best available rosbags typestore, or None."""
+    try:
+        from rosbags.typesys import get_typestore, Stores
+    except ImportError:
+        return None
+    for name in ["ROS2_HUMBLE", "ROS2_IRON", "ROS2_GALACTIC", "ROS2_FOXY"]:
+        try:
+            return get_typestore(getattr(Stores, name))
+        except Exception:
+            continue
+    return None
+
+
+def _open_any_reader(bag_path: Path, bag_files: list[Path]):
     """
-    Try rosbags.highlevel.AnyReader (needs metadata.yaml).
-    Returns the reader object (not entered), or None if unavailable.
+    Try rosbags.highlevel.AnyReader.
+    • For .mcap files: pass them directly (no metadata.yaml needed).
+    • For .db3 files: pass the directory if metadata.yaml exists.
+    Always provides a default_typestore to avoid 'no type definitions' error.
+    Returns an un-entered reader, or None if rosbags is unavailable.
     """
     try:
         from rosbags.highlevel import AnyReader
-        meta = bag_path / "metadata.yaml"
-        if not meta.exists():
-            return None
-        return AnyReader([bag_path])
-    except Exception:
+    except ImportError:
         return None
 
+    typestore = _get_typestore()
+    kwargs = {"default_typestore": typestore} if typestore else {}
 
-def _open_reader(bag_path: Path, db3_files: list[Path]):
+    fmt = _bag_format(bag_files)
+    try:
+        if fmt == "mcap":
+            return AnyReader(bag_files, **kwargs)
+        # db3: need the directory (AnyReader reads metadata.yaml from there)
+        meta = bag_path / "metadata.yaml"
+        if meta.exists():
+            return AnyReader([bag_path], **kwargs)
+    except Exception:
+        pass
+    return None
+
+
+def _open_reader(bag_path: Path, bag_files: list[Path]):
     """
     Return a context manager that can iterate bag messages.
-    Tries AnyReader first; falls back to _SqliteReader.
+    Priority:
+      1. rosbags AnyReader  — works for .mcap and .db3-with-metadata
+      2. _SqliteReader      — direct SQLite fallback for .db3-without-metadata
+    Exits with an error if .mcap files are present but rosbags is not installed.
     """
-    any_r = _open_any_reader(bag_path)
+    any_r = _open_any_reader(bag_path, bag_files)
     if any_r is not None:
-        return any_r          # rosbags AnyReader (has metadata.yaml)
-    return _SqliteReader(db3_files)   # direct SQLite fallback
+        return any_r
+
+    fmt = _bag_format(bag_files)
+    if fmt == "mcap":
+        sys.exit(
+            "[ERROR] MCAP bags require rosbags with mcap support.\n"
+            "  Install with: pip install 'rosbags[mcap]'")
+
+    # .db3 without metadata.yaml → direct SQLite reader
+    return _SqliteReader(bag_files)
 
 
 def _topics_from_reader(reader) -> list[str]:
@@ -324,8 +375,8 @@ def _iter_topic(reader, topic: str):
 # Data extraction
 # ════════════════════════════════════════════════════════════════════════════
 
-def list_topics(bag_path: Path, db3_files: list[Path]) -> None:
-    reader = _open_reader(bag_path, db3_files)
+def list_topics(bag_path: Path, bag_files: list[Path]) -> None:
+    reader = _open_reader(bag_path, bag_files)
     print(f"\nTopics in {bag_path}:")
     if isinstance(reader, _SqliteReader):
         with reader:
@@ -337,7 +388,7 @@ def list_topics(bag_path: Path, db3_files: list[Path]) -> None:
                 print(f"  {c.topic:<50s}  {c.msgtype}")
 
 
-def _best_image_from_bag(bag_path: Path, db3_files: list[Path],
+def _best_image_from_bag(bag_path: Path, bag_files: list[Path],
                           image_topic: str, min_markers: int,
                           aruco_dict,
                           save_any_frame: str | None = None) -> np.ndarray | None:
@@ -359,7 +410,7 @@ def _best_image_from_bag(bag_path: Path, db3_files: list[Path],
             _, ids, _ = aruco.detectMarkers(gray, aruco_dict, parameters=det_params)
             return len(ids) if ids is not None else 0
 
-    reader = _open_reader(bag_path, db3_files)
+    reader = _open_reader(bag_path, bag_files)
     with reader:
         for _ts, msg in _iter_topic(reader, image_topic):
             n_iter += 1
@@ -429,10 +480,10 @@ def _best_image_from_bag(bag_path: Path, db3_files: list[Path],
     return best_img
 
 
-def _read_cloud(bag_path: Path, db3_files: list[Path],
+def _read_cloud(bag_path: Path, bag_files: list[Path],
                 lidar_topic: str) -> np.ndarray:
     parts = []
-    reader = _open_reader(bag_path, db3_files)
+    reader = _open_reader(bag_path, bag_files)
     with reader:
         for _ts, msg in _iter_topic(reader, lidar_topic):
             try:
@@ -468,18 +519,21 @@ def _auto_image_topic(topics: list[str]) -> str | None:
 def _open_bag(path_str: str, label: str) -> tuple[Path, list[Path]]:
     """Resolve a user-supplied bag path; print a summary; exit on failure."""
     p = Path(path_str).resolve()
-    db3s = _resolve_db3(p)
-    if not db3s:
+    bag_files = _resolve_bag_files(p)
+    if not bag_files:
         sys.exit(
-            f"[ERROR] No .db3 files found at: {p}\n"
-            f"  Make sure the path is the bag directory or the .db3 file itself.")
-    bag_path = db3s[0].parent
-    has_meta = _has_metadata(db3s[0])
-    print(f"[{label}] found {len(db3s)} db3 file(s): {[f.name for f in db3s]}")
+            f"[ERROR] No .db3 or .mcap files found at: {p}\n"
+            f"  Make sure the path is the bag directory or the bag file itself.")
+    bag_path = bag_files[0].parent
+    fmt      = _bag_format(bag_files)
+    has_meta = _has_metadata(bag_files)
+    print(f"[{label}] found {len(bag_files)} {fmt} file(s): "
+          f"{[f.name for f in bag_files]}")
     print(f"[{label}] directory  : {bag_path}")
-    print(f"[{label}] metadata.yaml: "
-          f"{'YES' if has_meta else 'NO — using direct SQLite reader'}")
-    return bag_path, db3s
+    if fmt == "db3":
+        print(f"[{label}] metadata.yaml: "
+              f"{'YES' if has_meta else 'NO — using direct SQLite reader'}")
+    return bag_path, bag_files
 
 
 def parse_args():
@@ -523,27 +577,27 @@ def main():
         sys.exit(f"[ERROR] Config not found: {config_path}")
 
     # ── open bag(s) ───────────────────────────────────────────────────────────
-    lidar_bag_path, lidar_db3s = _open_bag(args.bag, "LiDAR bag")
+    lidar_bag_path, lidar_bag_files = _open_bag(args.bag, "LiDAR bag")
 
     if args.camera_bag:
-        cam_bag_path, cam_db3s = _open_bag(args.camera_bag, "Camera bag")
+        cam_bag_path, cam_bag_files = _open_bag(args.camera_bag, "Camera bag")
     else:
-        cam_bag_path, cam_db3s = lidar_bag_path, lidar_db3s
+        cam_bag_path, cam_bag_files = lidar_bag_path, lidar_bag_files
 
     # ── list-topics ───────────────────────────────────────────────────────────
     if args.list_topics:
         print("\nTopics in LiDAR bag:")
-        list_topics(lidar_bag_path, lidar_db3s)
+        list_topics(lidar_bag_path, lidar_bag_files)
         if args.camera_bag:
             print("\nTopics in camera bag:")
-            list_topics(cam_bag_path, cam_db3s)
+            list_topics(cam_bag_path, cam_bag_files)
         return
 
     cfg = load_config(config_path)
     os.makedirs(output_dir, exist_ok=True)
 
     # ── topic resolution — LiDAR bag ──────────────────────────────────────────
-    with _open_reader(lidar_bag_path, lidar_db3s) as r:
+    with _open_reader(lidar_bag_path, lidar_bag_files) as r:
         lidar_topics = _topics_from_reader(r)
     print(f"[LiDAR bag] topics: {lidar_topics}")
 
@@ -556,7 +610,7 @@ def main():
 
     # ── topic resolution — camera bag ─────────────────────────────────────────
     if args.camera_bag:
-        with _open_reader(cam_bag_path, cam_db3s) as r:
+        with _open_reader(cam_bag_path, cam_bag_files) as r:
             cam_topics = _topics_from_reader(r)
         print(f"[Camera bag] topics: {cam_topics}")
     else:
@@ -582,7 +636,7 @@ def main():
         print(f"[Image] Scanning '{image_topic}' for best ArUco frame "
               f"(min_markers={min_markers}) …")
         adict = aruco.getPredefinedDictionary(aruco.DICT_6X6_250)
-        image = _best_image_from_bag(cam_bag_path, cam_db3s, image_topic,
+        image = _best_image_from_bag(cam_bag_path, cam_bag_files, image_topic,
                                      min_markers, adict,
                                      save_any_frame=args.save_any_frame)
         if image is None:
@@ -596,7 +650,7 @@ def main():
 
     # ── point cloud ───────────────────────────────────────────────────────────
     print(f"\n[Cloud] Reading all messages on '{lidar_topic}' …")
-    pts_N4 = _read_cloud(lidar_bag_path, lidar_db3s, lidar_topic)
+    pts_N4 = _read_cloud(lidar_bag_path, lidar_bag_files, lidar_topic)
     if len(pts_N4) == 0:
         sys.exit(
             f"[ERROR] No point cloud data found on '{lidar_topic}'.\n"

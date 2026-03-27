@@ -559,6 +559,38 @@ def _auto_image_topic(topics: list[str]) -> str | None:
 
 
 # ════════════════════════════════════════════════════════════════════════════
+# Debug helpers
+# ════════════════════════════════════════════════════════════════════════════
+
+def _save_cloud(pts_N4: np.ndarray, path: str, output_dir: str) -> None:
+    """Save Nx4 (x,y,z,ring) point cloud to .ply or .npz for external viewing."""
+    if not os.path.isabs(path):
+        path = os.path.join(output_dir, path)
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    xyz = pts_N4[:, :3].astype(np.float32)
+    if path.endswith('.npz'):
+        np.savez_compressed(path, xyz=xyz)
+        print(f"[Cloud] Saved {len(xyz):,} pts → {path}  (load: np.load(f)['xyz'])")
+    else:
+        # ASCII PLY — viewable in CloudCompare, MeshLab, Open3D, etc.
+        if not path.endswith('.ply'):
+            path += '.ply'
+        header = (f"ply\nformat ascii 1.0\n"
+                  f"element vertex {len(xyz)}\n"
+                  f"property float x\nproperty float y\nproperty float z\n"
+                  f"end_header\n")
+        with open(path, 'w') as f:
+            f.write(header)
+            for x, y, z in xyz:
+                f.write(f"{x:.4f} {y:.4f} {z:.4f}\n")
+        print(f"[Cloud] Saved {len(xyz):,} pts → {path}")
+        print(f"  View with: python3 -c \""
+              f"import open3d as o3d; o3d.visualization.draw_geometries("
+              f"[o3d.io.read_point_cloud('{path}')])\"")
+        print(f"  Or: CloudCompare / MeshLab (File → Open)")
+
+
+# ════════════════════════════════════════════════════════════════════════════
 # Main
 # ════════════════════════════════════════════════════════════════════════════
 
@@ -612,6 +644,9 @@ def parse_args():
     p.add_argument("--max-cloud-frames", type=int, default=50, metavar="N",
                    help="Max LiDAR frames to accumulate (default: 50 ≈ 5 s at 10 Hz).\n"
                         "Use 0 to read all frames (may use a lot of RAM).")
+    p.add_argument("--save-cloud", default=None, metavar="PATH",
+                   help="Save accumulated point cloud to PATH (.ply or .npz) for "
+                        "external visualisation (e.g. CloudCompare, MeshLab, Open3D).")
     return p.parse_args()
 
 
@@ -703,6 +738,9 @@ def main():
           f"frames on '{lidar_topic}' …")
     pts_N4 = _read_cloud(lidar_bag_path, lidar_bag_files, lidar_topic,
                          max_frames=max_frames)
+
+    if args.save_cloud and len(pts_N4):
+        _save_cloud(pts_N4, args.save_cloud, output_dir)
     if len(pts_N4) == 0:
         sys.exit(
             f"[ERROR] No point cloud data found on '{lidar_topic}'.\n"

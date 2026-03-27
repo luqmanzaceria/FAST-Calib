@@ -66,13 +66,13 @@
   # z_min: 0.0 # avia and mid360: -0.5 ouster: -0.8
   # z_max: 2.0
 
-  # Wide search — use this first to find where the board is
-  x_min: 0.3
-  x_max: 5.0
-  y_min: -2.0
-  y_max: 2.0
-  z_min: -1.0
-  z_max: 2.0
+  #works for original bag
+  x_min: 2.0
+  x_max: 6.0
+  y_min: -1.0
+  y_max: 4.0
+  z_min: -0.5
+  z_max: 2.5
 
   # x_min: -0.5    # Was 2.0 - go wider
   # x_max: 2.5    # Was 6.0 - go wider  

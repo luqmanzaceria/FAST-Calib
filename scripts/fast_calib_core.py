@@ -686,6 +686,253 @@ def detect_lidar(pts_N4: np.ndarray, cfg: dict):
     return result, "solid"
 
 
+def _solid_lidar_viz_data(pts_N4: np.ndarray, cfg: dict) -> dict:
+    """Run solid-state steps through circle fitting; return data for matplotlib."""
+    out: dict = {"ok": False, "mode": "solid", "reason": ""}
+    xyz = passthrough_filter(pts_N4[:, :3], cfg)
+    out["xyz_filt"] = xyz
+    if len(xyz) < 20:
+        out["reason"] = f"passthrough: {len(xyz)} pts (< 20)"
+        return out
+    xyz_v = _voxel_downsample(xyz, 0.02)
+    normal, inliers = _plane_fit_ransac(xyz_v)
+    plane_pts = xyz_v[inliers]
+    if len(plane_pts) < 20:
+        out["reason"] = "plane inliers < 20"
+        return out
+    pts_2d, R_align, avg_z = align_plane_to_z0(plane_pts, normal)
+    bdry_idx = _boundary_indices(pts_2d, radius=0.03, min_gap=np.pi / 4)
+    bdry_2d = pts_2d[bdry_idx]
+    if len(bdry_2d) < 5:
+        out["reason"] = f"boundary pts: {len(bdry_2d)}"
+        return out
+    pcd_b = o3d.geometry.PointCloud()
+    pcd_b.points = o3d.utility.Vector3dVector(
+        np.column_stack([bdry_2d, np.zeros(len(bdry_2d))]))
+    labels = np.asarray(pcd_b.cluster_dbscan(
+        eps=0.05, min_points=10, print_progress=False))
+    r_target = cfg["circle_radius"]
+    centers_2d: list = []
+    for lbl in range(int(labels.max()) + 1):
+        clust = bdry_2d[labels == lbl]
+        if len(clust) < 5:
+            continue
+        center, inliers_c = ransac_circle_2d(clust, r_target, dist_thr=0.02)
+        if center is None:
+            continue
+        dists = np.hypot(clust[inliers_c, 0] - center[0],
+                         clust[inliers_c, 1] - center[1])
+        err = float(np.mean(np.abs(dists - r_target)))
+        if err < 0.030:
+            centers_2d.append(np.array(center, dtype=np.float64))
+    R_inv = np.linalg.inv(R_align)
+    centers_3d = (np.array([R_inv @ np.array([cx, cy, avg_z])
+                            for cx, cy in centers_2d], dtype=np.float64)
+                  if centers_2d else np.empty((0, 3)))
+    out.update(ok=True, pts_2d=pts_2d, bdry_2d=bdry_2d, labels=labels,
+               centers_2d=centers_2d, centers_3d=centers_3d,
+               r_target=r_target, R_align=R_align, avg_z=avg_z)
+    return out
+
+
+def _mech_lidar_viz_data(pts_N4: np.ndarray, cfg: dict) -> dict:
+    """Run mechanical pipeline through circle fitting; return data for matplotlib."""
+    out: dict = {"ok": False, "mode": "mech", "reason": ""}
+    filt = passthrough_filter(pts_N4, cfg)
+    out["xyz_filt"] = filt[:, :3] if len(filt) else np.empty((0, 3))
+    if len(filt) < 20:
+        out["reason"] = f"passthrough: {len(filt)} pts"
+        return out
+    normal, inliers = _plane_fit_ransac(filt[:, :3])
+    plane_pts = filt[inliers]
+    a, b, c = normal
+    norm_n = float(np.linalg.norm(normal))
+    if norm_n < 1e-9:
+        out["reason"] = "degenerate plane normal"
+        return out
+    GAP_THR, MIN_PTS, PLANE_THR = 0.10, 10, 0.03
+    rings: dict = {}
+    for pt in filt:
+        r = int(pt[3])
+        rings.setdefault(r, []).append(pt)
+    edge_pts = []
+    for pts_ring in rings.values():
+        if len(pts_ring) < MIN_PTS:
+            continue
+        pr = np.array(pts_ring)
+        for k in range(1, len(pr) - 1):
+            px, py, pz = pr[k, :3]
+            dp = abs(a * px + b * py + c * pz
+                     + (a * plane_pts[0, 0] + b * plane_pts[0, 1]
+                        + c * plane_pts[0, 2])) / norm_n
+            if dp >= PLANE_THR:
+                continue
+            d_prev = float(np.linalg.norm(pr[k, :3] - pr[k - 1, :3]))
+            d_next = float(np.linalg.norm(pr[k, :3] - pr[k + 1, :3]))
+            if d_prev > GAP_THR or d_next > GAP_THR:
+                edge_pts.append(pr[k, :3])
+    if len(edge_pts) < 5:
+        out["reason"] = f"edge pts: {len(edge_pts)}"
+        return out
+    edge_arr = np.array(edge_pts)
+    pts_2d, R_align, avg_z = align_plane_to_z0(edge_arr, normal)
+    r_target = cfg["circle_radius"]
+    remaining = pts_2d.copy()
+    centers_2d: list = []
+    while len(remaining) > 3 and len(centers_2d) < TARGET_NUM_CIRCLES + 4:
+        center, inliers = ransac_circle_2d(remaining, r_target,
+                                            dist_thr=0.02, max_iter=500,
+                                            min_inliers=5)
+        if center is None:
+            break
+        centers_2d.append(np.array(center, dtype=np.float64))
+        remaining = np.delete(remaining, inliers, axis=0)
+    R_inv = np.linalg.inv(R_align)
+    centers_3d = (np.array([R_inv @ np.array([cx, cy, avg_z])
+                            for cx, cy in centers_2d], dtype=np.float64)
+                  if centers_2d else np.empty((0, 3)))
+    out.update(ok=True, edge_2d=pts_2d, centers_2d=centers_2d,
+               centers_3d=centers_3d, r_target=r_target)
+    return out
+
+
+def save_lidar_circle_diagnostic(pts_N4: np.ndarray, cfg: dict, out_path: str) -> None:
+    """
+    Write a PNG with two panels:
+      • Left: board-plane 2D view — cloud / boundary clusters / fitted circles + centroids
+      • Right: LiDAR-frame XY — passthrough points + centroid markers (indexed)
+
+    Uses mechanical viz if the cloud has a ring field and edge extraction succeeds;
+    otherwise solid-state (same logic as detect_solid_lidar).
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Circle as MplCircle
+
+    has_ring = np.any(pts_N4[:, 3] != 0xFFFF)
+    data: dict
+    title = "LiDAR circle diagnostic"
+    if has_ring:
+        data = _mech_lidar_viz_data(pts_N4, cfg)
+        if not data.get("ok") or len(data.get("centers_2d", [])) == 0:
+            data = _solid_lidar_viz_data(pts_N4, cfg)
+            title += " — solid-state (mech had no circle fits)"
+        else:
+            title += " — mechanical (ring) pipeline"
+    else:
+        data = _solid_lidar_viz_data(pts_N4, cfg)
+        title += " — solid-state pipeline"
+
+    fig, (ax0, ax1) = plt.subplots(1, 2, figsize=(14, 6.2))
+    fig.suptitle(title, fontsize=12, fontweight="bold")
+
+    r_tar = float(cfg["circle_radius"])
+
+    if not data.get("ok"):
+        msg = data.get("reason", "unknown")
+        ax0.text(0.5, 0.5, f"LiDAR viz failed:\n{msg}", ha="center", va="center",
+                 transform=ax0.transAxes, fontsize=11)
+        ax0.set_axis_off()
+        ax1.text(0.5, 0.5, f"LiDAR viz failed:\n{msg}", ha="center", va="center",
+                 transform=ax1.transAxes, fontsize=11)
+        ax1.set_axis_off()
+    elif data["mode"] == "mech":
+        edge_2d = data["edge_2d"]
+        ax0.scatter(edge_2d[:, 0], edge_2d[:, 1], s=1.0, c="#888888",
+                    alpha=0.7, rasterized=True, label="edge pts")
+        centers_2d = data["centers_2d"]
+        for i, c2 in enumerate(centers_2d):
+            cx, cy = float(c2[0]), float(c2[1])
+            ax0.plot(cx, cy, "r*", markersize=16, markeredgecolor="black",
+                    markeredgewidth=0.4, zorder=6)
+            ax0.add_patch(MplCircle((cx, cy), r_tar, fill=False, edgecolor="red",
+                                    linestyle="--", linewidth=1.0, zorder=5))
+            ax0.annotate(f" {i}", (cx, cy), fontsize=10, color="darkred",
+                         xytext=(4, 4), textcoords="offset points")
+        ax0.set_aspect("equal")
+        ax0.set_title("Mechanical — plane 2D (edges + RANSAC circles)")
+        ax0.set_xlabel("u [m]")
+        ax0.set_ylabel("v [m]")
+        ax0.grid(True, alpha=0.3)
+        ax0.legend(loc="upper right", fontsize=7)
+    else:
+        pts_2d = data["pts_2d"]
+        bdry_2d = data["bdry_2d"]
+        labels = data["labels"]
+        ax0.scatter(pts_2d[:, 0], pts_2d[:, 1], s=0.35, c="#cccccc",
+                    alpha=0.45, rasterized=True, label="plane inliers")
+        nlab = int(labels.max()) + 1 if labels.size and labels.max() >= 0 else 0
+        cmap = plt.cm.get_cmap("tab10")
+        for lbl in range(nlab):
+            m = labels == lbl
+            if not np.any(m):
+                continue
+            ax0.scatter(bdry_2d[m, 0], bdry_2d[m, 1], s=2.5,
+                        c=[cmap(lbl % 10)], rasterized=True, label=f"cluster {lbl}")
+        if np.any(labels < 0):
+            m = labels < 0
+            ax0.scatter(bdry_2d[m, 0], bdry_2d[m, 1], s=1, c="#aaaaaa",
+                        alpha=0.5, rasterized=True, label="noise")
+        centers_2d = data["centers_2d"]
+        for i, c2 in enumerate(centers_2d):
+            cx, cy = float(c2[0]), float(c2[1])
+            ax0.plot(cx, cy, "r*", markersize=16, markeredgecolor="black",
+                    markeredgewidth=0.4, zorder=6)
+            ax0.add_patch(MplCircle((cx, cy), r_tar, fill=False, edgecolor="red",
+                                    linestyle="--", linewidth=1.0, zorder=5))
+            ax0.annotate(f" {i}", (cx, cy), fontsize=10, color="darkred",
+                         xytext=(4, 4), textcoords="offset points")
+        ax0.set_aspect("equal")
+        ax0.set_title("Solid-state — plane 2D (boundary DBSCAN + circles)")
+        ax0.set_xlabel("u [m]")
+        ax0.set_ylabel("v [m]")
+        ax0.grid(True, alpha=0.3)
+        ax0.legend(loc="upper right", fontsize=7, markerscale=3)
+
+    # Right: XY in LiDAR frame
+    xyz_f = data.get("xyz_filt", np.empty((0, 3)))
+    if len(xyz_f) == 0:
+        ax1.text(0.5, 0.5, "No passthrough points", ha="center", va="center",
+                 transform=ax1.transAxes)
+        ax1.set_axis_off()
+    else:
+        sub = xyz_f
+        if len(sub) > 100_000:
+            sub = sub[np.random.choice(len(sub), 100_000, replace=False)]
+        sc = ax1.scatter(sub[:, 0], sub[:, 1], s=0.35, c=sub[:, 2],
+                       cmap="viridis", alpha=0.55, rasterized=True)
+        plt.colorbar(sc, ax=ax1, label="z [m]", fraction=0.046, pad=0.02)
+        c3 = data.get("centers_3d", np.empty((0, 3)))
+        if len(c3):
+            ax1.scatter(c3[:, 0], c3[:, 1], c="red", s=120, marker="*",
+                        zorder=6, edgecolors="black", linewidths=0.5,
+                        label="centroids")
+            for i, p in enumerate(c3):
+                ax1.annotate(f" {i}", (p[0], p[1]), fontsize=10, color="white",
+                             xytext=(5, 5), textcoords="offset points",
+                             fontweight="bold")
+        ax1.set_aspect("equal")
+        ax1.set_title("LiDAR frame XY (passthrough) + centroid indices")
+        ax1.set_xlabel("x [m]")
+        ax1.set_ylabel("y [m]")
+        ax1.grid(True, alpha=0.3)
+        if len(c3):
+            ax1.legend(loc="upper right", fontsize=8)
+
+    n_c = len(data.get("centers_3d", []))
+    fig.text(0.5, 0.02,
+             f"circle_radius={r_tar:.3f} m   candidates={n_c}   "
+             f"(geometry check may reject subsets of 4)",
+             ha="center", fontsize=9, style="italic")
+
+    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+    plt.tight_layout(rect=[0, 0.04, 1, 0.95])
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"[Calib] LiDAR circle diagnostic saved → {out_path}")
+
+
 # ════════════════════════════════════════════════════════════════════════════
 # 6.  SVD transform estimation
 # ════════════════════════════════════════════════════════════════════════════

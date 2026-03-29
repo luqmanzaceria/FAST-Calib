@@ -4,7 +4,7 @@ calib_from_bag_ros2.py — Offline LiDAR-camera extrinsic calibration
                           from a ROS2 bag (.db3 or .mcap).
 
 No ROS installation required.  Install dependencies with:
-    pip install "rosbags[mcap]" numpy "opencv-python>=4.5" open3d pyyaml
+    pip install "rosbags[mcap]" numpy "opencv-python>=4.5" open3d pyyaml matplotlib
 
 Usage:
     python3 scripts/calib_from_bag_ros2.py \\
@@ -40,7 +40,11 @@ import numpy as np
 _HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(_HERE))
 from fast_calib_core import (
-    load_config, decode_pointcloud2, decode_image_msg, run_calibration
+    load_config,
+    decode_pointcloud2,
+    decode_image_msg,
+    run_calibration,
+    save_lidar_circle_diagnostic,
 )
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -612,6 +616,12 @@ def parse_args():
     p.add_argument("--max-cloud-frames", type=int, default=50, metavar="N",
                    help="Max LiDAR frames to accumulate (default: 50 ≈ 5 s at 10 Hz).\n"
                         "Use 0 to read all frames (may use a lot of RAM).")
+    p.add_argument("--no-lidar-scan", action="store_true",
+                   help="Do not write lidar_circle_scan.png (boundary clusters, "
+                        "fitted circles, centroids in plane + XY).")
+    p.add_argument("--lidar-scan", default=None, metavar="PATH",
+                   help="Override path for LiDAR circle diagnostic PNG "
+                        "(default: <output-dir>/lidar_circle_scan.png).")
     return p.parse_args()
 
 
@@ -709,6 +719,14 @@ def main():
             f"[ERROR] No point cloud data found on '{lidar_topic}'.\n"
             f"  Run --list-topics to see available topics.")
     print(f"[Cloud] Total accumulated points: {len(pts_N4):,}")
+
+    # ── LiDAR circle diagnostic (plane view + XY centroids) ─────────────────
+    if not args.no_lidar_scan:
+        scan_path = args.lidar_scan or os.path.join(output_dir, "lidar_circle_scan.png")
+        try:
+            save_lidar_circle_diagnostic(pts_N4, cfg, scan_path)
+        except ImportError as e:
+            print(f"[Calib] Skipping LiDAR circle diagnostic (need matplotlib): {e}")
 
     # ── calibration ───────────────────────────────────────────────────────────
     print("\n[Calib] Running calibration pipeline …\n")

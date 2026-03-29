@@ -1,44 +1,44 @@
 """
 publish_filter_box.launch.py — Run publish_filter_box_rviz.py from this repo layout.
 
-Expects: launch/ and scripts/ under the same package root (typical git clone).
+The script path is resolved relative to this launch file: <parent>/scripts/publish_filter_box_rviz.py
+(works when the repo has launch/ and scripts/ under the same root).
 
 Usage:
     ros2 launch fast_calib publish_filter_box.launch.py
-    ros2 launch fast_calib publish_filter_box.launch.py frame_id:=lidar_frame
+    ros2 launch fast_calib publish_filter_box.launch.py frame_id:=os_sensor
 """
 
 from pathlib import Path
 
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, ExecuteProcess
-from launch.substitutions import LaunchConfiguration
+from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
 from launch_ros.substitutions import FindPackageShare
 
 
 def generate_launch_description():
     pkg_share = FindPackageShare("fast_calib")
-    # share/.. is install prefix; share/../lib/... or for source overlays use path via substitution
-    # Resolve script next to share: many workspaces put share at install/fast_calib/share/fast_calib
-    # Fallback: path relative to this file when launch is run from source (launch beside scripts)
     launch_dir = Path(__file__).resolve().parent
-    repo_scripts = launch_dir.parent / "scripts" / "publish_filter_box_rviz.py"
+    script_path = launch_dir.parent / "scripts" / "publish_filter_box_rviz.py"
 
     return LaunchDescription([
         DeclareLaunchArgument(
             "config_path",
-            default_value="",
-            description="qr_params.yaml (empty = <pkg share>/config/qr_params.yaml)",
+            default_value=PathJoinSubstitution(
+                [pkg_share, "config", "qr_params.yaml"]
+            ),
+            description="Path to qr_params.yaml",
         ),
         DeclareLaunchArgument(
             "frame_id",
             default_value="",
-            description="Marker frame (empty = sniff from cloud)",
+            description="Marker frame (empty = sniff from first PointCloud2)",
         ),
         DeclareLaunchArgument(
             "cloud_topic",
             default_value="",
-            description="PointCloud2 topic for sniffing (empty = from yaml /sensor_scan)",
+            description="PointCloud2 topic for sniffing (empty = yaml lidar_topic or /sensor_scan)",
         ),
         DeclareLaunchArgument(
             "marker_topic",
@@ -54,7 +54,7 @@ def generate_launch_description():
         ExecuteProcess(
             cmd=[
                 "python3",
-                str(repo_scripts),
+                str(script_path),
                 "--config",
                 LaunchConfiguration("config_path"),
                 "--frame-id",
@@ -67,6 +67,5 @@ def generate_launch_description():
                 LaunchConfiguration("rate"),
             ],
             output="screen",
-            shell=False,
         ),
     ])

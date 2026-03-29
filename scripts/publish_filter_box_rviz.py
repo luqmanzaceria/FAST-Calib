@@ -148,7 +148,8 @@ def main() -> None:
         default=2.0,
         help="Publish rate (Hz)",
     )
-    args = parser.parse_args(remove_ros_args(sys.argv))
+    argv = remove_ros_args(sys.argv)
+    args = parser.parse_args(argv[1:] if len(argv) > 1 else [])
 
     cfg = load_config(args.config)
     bounds = _read_bounds(cfg)

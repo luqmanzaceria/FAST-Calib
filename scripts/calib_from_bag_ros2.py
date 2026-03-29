@@ -16,6 +16,10 @@ Usage:
         [--lidar-topic   /sensor_scan]         \\
         [--output-dir    output/]
 
+One lidar frame + one image (time-aligned, same bag only):
+    python3 scripts/calib_from_bag_ros2.py --bag /path/to/bag \\
+        --config config/qr_params.yaml --single-synced-pair
+
 The bag path may be:
   • a bag DIRECTORY containing *.db3 or *.mcap files
   • the *.db3 FILE itself  (works even without metadata.yaml)
@@ -23,6 +27,10 @@ The bag path may be:
 
 If --image is omitted the script scans the image topic for the sharpest
 frame that has >= min_detected_markers ArUco markers visible.
+
+Use --single-synced-pair (same bag for camera + LiDAR) to pick exactly one
+PointCloud2 and one image: the pair with the smallest |t_lidar − t_image|
+within --sync-max-delta-ms (avoids motion blur from stacking many scans).
 """
 
 from __future__ import annotations
@@ -506,6 +514,98 @@ def _best_image_from_bag(bag_path: Path, bag_files: list[Path],
     return best_img
 
 
+def _msg_stamp_ns(msg) -> int:
+    """ROS 2 header stamp → int nanoseconds."""
+    st = msg.header.stamp
+    return int(st.sec) * 1_000_000_000 + int(st.nanosec)
+
+
+def _collect_cloud_frames(
+    bag_path: Path, bag_files: list[Path], lidar_topic: str
+) -> list[tuple[int, np.ndarray]]:
+    """All decoded PointCloud2 frames as (timestamp_ns, Nx4 pts)."""
+    out: list[tuple[int, np.ndarray]] = []
+    reader = _open_reader(bag_path, bag_files)
+    with reader:
+        for ts, msg in _iter_topic(reader, lidar_topic):
+            try:
+                pts = decode_pointcloud2(msg)
+            except Exception:
+                continue
+            if len(pts) == 0:
+                continue
+            out.append((int(ts), pts))
+    return out
+
+
+def _collect_marker_images(
+    bag_path: Path,
+    bag_files: list[Path],
+    image_topic: str,
+    min_markers: int,
+    aruco_dict,
+) -> list[tuple[int, np.ndarray]]:
+    """(timestamp_ns, BGR) for every frame with >= min_markers ArUco markers."""
+    out: list[tuple[int, np.ndarray]] = []
+    try:
+        det_params = aruco.DetectorParameters()
+        detector = aruco.ArucoDetector(aruco_dict, det_params)
+
+        def _count(gray):
+            _, ids, _ = detector.detectMarkers(gray)
+            return len(ids) if ids is not None else 0
+    except AttributeError:
+        det_params = aruco.DetectorParameters_create()
+
+        def _count(gray):
+            _, ids, _ = aruco.detectMarkers(gray, aruco_dict, parameters=det_params)
+            return len(ids) if ids is not None else 0
+
+    reader = _open_reader(bag_path, bag_files)
+    with reader:
+        for bag_ts, msg in _iter_topic(reader, image_topic):
+            try:
+                bgr = decode_image_msg(msg)
+            except Exception:
+                continue
+            gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+            if _count(gray) < min_markers:
+                continue
+            try:
+                tns = _msg_stamp_ns(msg)
+            except Exception:
+                tns = int(bag_ts)
+            out.append((tns, bgr.copy()))
+    return out
+
+
+def _best_time_sync_pair(
+    clouds: list[tuple[int, np.ndarray]],
+    images: list[tuple[int, np.ndarray]],
+    max_delta_ns: int,
+) -> tuple[np.ndarray, np.ndarray, int, int, int] | None:
+    """
+    Return (pts_N4, bgr, t_cloud_ns, t_image_ns, abs_delta_ns) for the pair
+    with minimal |t_cloud − t_image| subject to delta <= max_delta_ns.
+    """
+    if not clouds or not images:
+        return None
+    images = sorted(images, key=lambda x: x[0])
+    img_ts = np.array([t for t, _ in images], dtype=np.int64)
+    best = None
+    best_d = None
+    for tc, pts in clouds:
+        j = int(np.searchsorted(img_ts, tc))
+        for idx in (j - 1, j):
+            if 0 <= idx < len(images):
+                ti = images[idx][0]
+                d = abs(tc - ti)
+                if d <= max_delta_ns and (best_d is None or d < best_d):
+                    best_d = d
+                    best = (pts, images[idx][1], tc, ti, int(d))
+    return best
+
+
 def _read_cloud(bag_path: Path, bag_files: list[Path],
                 lidar_topic: str,
                 max_frames: int = 50) -> np.ndarray:
@@ -615,7 +715,21 @@ def parse_args():
                    help="Save best ArUco frame to PATH for visual inspection")
     p.add_argument("--max-cloud-frames", type=int, default=50, metavar="N",
                    help="Max LiDAR frames to accumulate (default: 50 ≈ 5 s at 10 Hz).\n"
-                        "Use 0 to read all frames (may use a lot of RAM).")
+                        "Use 0 to read all frames (may use a lot of RAM). "
+                        "Use 1 for a single scan (no time sync with image).")
+    p.add_argument(
+        "--single-synced-pair",
+        action="store_true",
+        help="Same bag only: pick one PointCloud2 and one image with the smallest "
+             "timestamp gap (≤ --sync-max-delta-ms). Skips stacking many scans.",
+    )
+    p.add_argument(
+        "--sync-max-delta-ms",
+        type=float,
+        default=100.0,
+        metavar="MS",
+        help="Max |t_lidar − t_image| for --single-synced-pair (default: 100 ms).",
+    )
     p.add_argument("--no-lidar-scan", action="store_true",
                    help="Do not write lidar_circle_scan.png (boundary clusters, "
                         "fitted circles, centroids in plane + XY).")
@@ -683,42 +797,82 @@ def main():
     print(f"[Config] {config_path}")
     print(f"[Output] {output_dir}\n")
 
-    # ── image ─────────────────────────────────────────────────────────────────
-    if args.image:
-        image = cv2.imread(args.image, cv2.IMREAD_COLOR)
-        if image is None:
-            sys.exit(f"[ERROR] Cannot read image: {args.image}")
-        print(f"[Image] Loaded from file: {args.image}")
-    else:
-        min_markers = (args.min_markers if args.min_markers is not None
-                       else int(cfg["min_detected_markers"]))
-        print(f"[Image] Scanning '{image_topic}' for best ArUco frame "
-              f"(min_markers={min_markers}) …")
-        adict = aruco.getPredefinedDictionary(aruco.DICT_6X6_250)
-        image = _best_image_from_bag(cam_bag_path, cam_bag_files, image_topic,
-                                     min_markers, adict,
-                                     save_any_frame=args.save_any_frame)
-        if image is None:
+    min_markers = (args.min_markers if args.min_markers is not None
+                   else int(cfg["min_detected_markers"]))
+    adict = aruco.getPredefinedDictionary(aruco.DICT_6X6_250)
+
+    # ── optional: one lidar frame + one image, time-aligned (same bag) ───────
+    if args.single_synced_pair:
+        if cam_bag_path.resolve() != lidar_bag_path.resolve():
             sys.exit(
-                f"[ERROR] No suitable image found on '{image_topic}'.\n"
-                f"  Run --list-topics to see available topics, or use "
-                f"--image /path/to/image.png")
+                "[ERROR] --single-synced-pair needs LiDAR and camera in the same bag "
+                "(omit --camera-bag).\n"
+                "  For separate bags, use e.g. --max-cloud-frames 1 and --image "
+                "path.png instead.")
+        if args.image:
+            sys.exit(
+                "[ERROR] --single-synced-pair cannot be used with --image "
+                "(file images have no bag timestamp).")
+        max_delta_ns = int(round(args.sync_max_delta_ms * 1e6))
+        print(f"[Pair] --single-synced-pair (max |Δt| = {args.sync_max_delta_ms:g} ms)\n")
+        print(f"[Pair] Collecting non-empty clouds on '{lidar_topic}' …", flush=True)
+        clouds = _collect_cloud_frames(lidar_bag_path, lidar_bag_files, lidar_topic)
+        print(f"[Pair]   {len(clouds)} frames", flush=True)
+        print(f"[Pair] Collecting images with ≥ {min_markers} markers on "
+              f"'{image_topic}' …", flush=True)
+        images = _collect_marker_images(
+            cam_bag_path, cam_bag_files, image_topic, min_markers, adict)
+        print(f"[Pair]   {len(images)} frames", flush=True)
+        best = _best_time_sync_pair(clouds, images, max_delta_ns)
+        if best is None:
+            sys.exit(
+                f"[ERROR] No time-aligned pair found (need non-empty lidar + "
+                f"≥{min_markers} markers, |t_lidar−t_image| ≤ {args.sync_max_delta_ms:g} ms).\n"
+                f"  Try a larger --sync-max-delta-ms, or use --max-cloud-frames 1, "
+                f"or relax --min-markers.")
+        pts_N4, image, tc, ti, d_ns = best
+        print(
+            f"[Pair] Using lidar stamp {tc} ns, image stamp {ti} ns, "
+            f"|Δt| = {d_ns / 1e6:.3f} ms, {len(pts_N4):,} points\n",
+            flush=True,
+        )
         saved = os.path.join(output_dir, "extracted_image.png")
         cv2.imwrite(saved, image)
-        print(f"[Image] Saved extracted image: {saved}")
+        print(f"[Image] Saved synced frame → {saved}", flush=True)
+    else:
+        # ── image ────────────────────────────────────────────────────────────
+        if args.image:
+            image = cv2.imread(args.image, cv2.IMREAD_COLOR)
+            if image is None:
+                sys.exit(f"[ERROR] Cannot read image: {args.image}")
+            print(f"[Image] Loaded from file: {args.image}")
+        else:
+            print(f"[Image] Scanning '{image_topic}' for best ArUco frame "
+                  f"(min_markers={min_markers}) …")
+            image = _best_image_from_bag(cam_bag_path, cam_bag_files, image_topic,
+                                         min_markers, adict,
+                                         save_any_frame=args.save_any_frame)
+            if image is None:
+                sys.exit(
+                    f"[ERROR] No suitable image found on '{image_topic}'.\n"
+                    f"  Run --list-topics to see available topics, or use "
+                    f"--image /path/to/image.png")
+            saved = os.path.join(output_dir, "extracted_image.png")
+            cv2.imwrite(saved, image)
+            print(f"[Image] Saved extracted image: {saved}")
 
-    # ── point cloud ───────────────────────────────────────────────────────────
-    max_frames = args.max_cloud_frames
-    print(f"\n[Cloud] Reading {'all' if not max_frames else f'up to {max_frames}'} "
-          f"frames on '{lidar_topic}' …")
-    pts_N4 = _read_cloud(lidar_bag_path, lidar_bag_files, lidar_topic,
-                         max_frames=max_frames)
+        # ── point cloud ───────────────────────────────────────────────────────
+        max_frames = args.max_cloud_frames
+        print(f"\n[Cloud] Reading {'all' if not max_frames else f'up to {max_frames}'} "
+              f"frames on '{lidar_topic}' …")
+        pts_N4 = _read_cloud(lidar_bag_path, lidar_bag_files, lidar_topic,
+                             max_frames=max_frames)
 
-    if len(pts_N4) == 0:
-        sys.exit(
-            f"[ERROR] No point cloud data found on '{lidar_topic}'.\n"
-            f"  Run --list-topics to see available topics.")
-    print(f"[Cloud] Total accumulated points: {len(pts_N4):,}")
+        if len(pts_N4) == 0:
+            sys.exit(
+                f"[ERROR] No point cloud data found on '{lidar_topic}'.\n"
+                f"  Run --list-topics to see available topics.")
+        print(f"[Cloud] Total accumulated points: {len(pts_N4):,}")
 
     # ── LiDAR circle diagnostic (plane view + XY centroids) ─────────────────
     if not args.no_lidar_scan:
